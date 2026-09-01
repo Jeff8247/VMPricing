@@ -1,5 +1,11 @@
+# Local Python environment and bytecode
 .venv/
 __pycache__/
 *.py[cod]
-vm_pricing_aud.csv
+
+# Generated pricing report
 vm_pricing_aud.xlsx
+
+# Local workspace metadata
+.agents/
+.codex/
