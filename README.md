@@ -1,8 +1,8 @@
 # Sydney VM pricing
 
-`vm_pricing.py` retrieves live public retail pricing for all currently available AWS EC2 and Azure VM sizes in Sydney that have exactly **2 vCPU / 8 GiB RAM** or **4 vCPU / 16 GiB RAM**. It reports three OS costs—Windows, standard no-licence Linux such as Ubuntu/Debian, and Red Hat Enterprise Linux—adds one 128 GiB disk, and produces a grouped console comparison plus an Excel workbook sorted by estimated monthly AUD cost.
+`vm_pricing.py` retrieves live public retail pricing for currently available AWS EC2 and Azure VM sizes in Sydney. The default build is exactly **4 vCPU / 16 GiB RAM**, and repeatable `--shape` switches can request other exact builds. It reports three OS costs—Windows, standard no-licence Linux such as Ubuntu/Debian, and Red Hat Enterprise Linux—adds one 128 GiB root/OS disk, and produces a grouped console comparison plus an Excel workbook sorted by estimated monthly AUD cost.
 
-The workbook contains separate **AWS** and **Azure** worksheets. For every selected OS, each sheet shows the 5 cheapest 2-vCPU/8-GiB options and the 5 cheapest 4-vCPU/16-GiB options by estimated monthly cost. A dedicated **VM Shape** column, different shading for each shape, and strong group dividers keep adjacent sizes visually distinct while preserving Excel filtering and sorting. The console output also uses separate OS-and-shape sections.
+The workbook contains separate **AWS** and **Azure** worksheets. For every selected OS and requested build, each sheet shows the 5 cheapest options by estimated monthly cost. A dedicated **VM Shape** column, different shading for each shape, and strong group dividers keep adjacent sizes visually distinct while preserving Excel filtering and sorting. The console output also uses separate OS-and-shape sections.
 
 The comparison uses:
 
@@ -50,7 +50,20 @@ python vm_pricing.py \
   --output vm_pricing_aud.xlsx
 ```
 
-Change the number of results per provider, OS, and VM shape with `--top`, for example `--top 10`. With the default three OS categories and both VM shapes, the default workbook can contain up to 30 rows on each provider worksheet.
+The default command queries only 4-vCPU/16-GiB builds. Use repeatable `--shape VCPU:RAM_GIB` switches to replace that default with one or more exact builds:
+
+```bash
+# Default: 4 vCPU / 16 GiB
+python vm_pricing.py
+
+# One different build
+python vm_pricing.py --shape 8:32
+
+# Multiple builds, including the former 2-vCPU/8-GiB build
+python vm_pricing.py --shape 2:8 --shape 8:32
+```
+
+Change the number of results per provider, OS, and VM shape with `--top`, for example `--top 10`. With the default three OS categories and one VM shape, the workbook can contain up to 15 rows on each provider worksheet.
 
 All three operating-system costs are included by default. Select only one when required with:
 
@@ -73,7 +86,7 @@ The tests use fixed mock feed records and do not require credentials or network 
 python -m unittest discover -s tests -v
 ```
 
-For a live smoke test, run the normal command with configured credentials and confirm the generated workbook contains both target shapes on the AWS and Azure worksheets. No prices are hard-coded, so live tests intentionally do not assert particular monetary values.
+For a live smoke test, run the normal command with configured credentials and confirm the generated workbook contains the requested shape on the AWS and Azure worksheets. No prices are hard-coded, so live tests intentionally do not assert particular monetary values.
 
 ## Pricing notes
 

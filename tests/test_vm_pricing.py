@@ -14,8 +14,10 @@ from vm_pricing import (
     build_row,
     cheapest_per_provider,
     fetch_aws_compute_price,
+    parse_args,
     parse_azure_sizes,
     parse_rba_usd_rate,
+    parse_shape,
     select_azure_e10_price,
     select_azure_rhel_license_prices,
     select_azure_windows_prices,
@@ -63,7 +65,12 @@ class PricingTests(unittest.TestCase):
             sku("Standard_Arm", 2, 8, "Arm64"),
             sku("Standard_Blocked", 2, 8, restrictions=[{"type": "Location", "values": [AZURE_REGION]}]),
         ]
-        self.assertEqual([item.name for item in parse_azure_sizes(items)], ["Standard_Good2", "Standard_Good4"])
+        self.assertEqual([item.name for item in parse_azure_sizes(items)], ["Standard_Good4"])
+        custom_shapes = frozenset({(2, Decimal("8")), (4, Decimal("16"))})
+        self.assertEqual(
+            [item.name for item in parse_azure_sizes(items, custom_shapes)],
+            ["Standard_Good2", "Standard_Good4"],
+        )
 
     def test_azure_windows_selector_excludes_non_payg_rates(self):
         base = {
@@ -128,7 +135,7 @@ class PricingTests(unittest.TestCase):
             "meterName": "2 vCPU VM BYOS License", "type": "Consumption", "unitOfMeasure": "1 Hour",
             "retailPrice": 0, "effectiveStartDate": "2026-01-01",
         })
-        selected = select_azure_rhel_license_prices(items)
+        selected = select_azure_rhel_license_prices(items, (2, 4))
         self.assertEqual(selected[2].value, Decimal("0.04"))
         self.assertEqual(selected[4].value, Decimal("0.08"))
 
@@ -164,7 +171,7 @@ class PricingTests(unittest.TestCase):
                     provider, "region", VmSize(f"size-{number}", 2, Decimal("8")), Decimal(number),
                     "disk", Decimal("0"), Decimal("730"), "2026-01-01",
                 ))
-        selected = cheapest_per_provider(rows, 10)
+        selected = cheapest_per_provider(rows, 10, frozenset({(2, Decimal("8"))}))
         self.assertEqual(sum(row.provider == "AWS" for row in selected), 10)
         self.assertEqual(sum(row.provider == "Azure" for row in selected), 10)
         self.assertNotIn("size-11", {row.instance_type for row in selected})
@@ -177,7 +184,7 @@ class PricingTests(unittest.TestCase):
                     "AWS", "region", VmSize(f"{operating_system}-{number}", 2, Decimal("8")), Decimal(number),
                     "disk", Decimal("0"), Decimal("730"), "2026-01-01", operating_system=operating_system,
                 ))
-        selected = cheapest_per_provider(rows, 10)
+        selected = cheapest_per_provider(rows, 10, frozenset({(2, Decimal("8"))}))
         self.assertEqual(sum(row.operating_system == OS_WINDOWS for row in selected), 10)
         self.assertEqual(sum(row.operating_system == OS_LINUX for row in selected), 10)
         self.assertEqual(sum(row.operating_system == OS_RHEL for row in selected), 10)
@@ -190,10 +197,26 @@ class PricingTests(unittest.TestCase):
                     "AWS", "region", VmSize(f"{vcpu}vcpu-{number}", vcpu, memory), Decimal(number),
                     "disk", Decimal("0"), Decimal("730"), "2026-01-01",
                 ))
-        selected = cheapest_per_provider(rows, 5)
+        selected = cheapest_per_provider(
+            rows, 5, frozenset({(2, Decimal("8")), (4, Decimal("16"))})
+        )
         self.assertEqual(sum(row.vcpu == 2 and row.memory_gib == 8 for row in selected), 5)
         self.assertEqual(sum(row.vcpu == 4 and row.memory_gib == 16 for row in selected), 5)
         self.assertEqual(len(selected), 10)
+
+    def test_shape_cli_defaults_to_4_vcpu_16_gib(self):
+        args = parse_args([])
+        self.assertIsNone(args.shape)
+        self.assertEqual(parse_shape("4:16"), (4, Decimal("16")))
+
+    def test_shape_cli_accepts_multiple_and_decimal_builds(self):
+        args = parse_args(["--shape", "2:8", "--shape", "8:31.5"])
+        self.assertEqual(args.shape, [(2, Decimal("8")), (8, Decimal("31.5"))])
+
+    def test_shape_cli_rejects_invalid_builds(self):
+        for value in ("8", "x:32", "4:zero", "0:16", "4:-1"):
+            with self.subTest(value=value), self.assertRaises(Exception):
+                parse_shape(value)
 
 
 if __name__ == "__main__":

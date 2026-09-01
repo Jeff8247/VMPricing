@@ -25,7 +25,7 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 
 AWS_REGION = "ap-southeast-2"
 AZURE_REGION = "australiaeast"
-TARGET_SHAPES = {(2, Decimal("8")), (4, Decimal("16"))}
+DEFAULT_TARGET_SHAPES = frozenset({(4, Decimal("16"))})
 RBA_RSS_URL = "https://www.rba.gov.au/rss/rss-cb-exchange-rates.xml"
 AZURE_RETAIL_URL = "https://prices.azure.com/api/retail/prices"
 AZURE_SKUS_API_VERSION = "2025-04-01"
@@ -173,7 +173,9 @@ def aws_clients(profile: str | None) -> tuple[Any, Any]:
     )
 
 
-def discover_aws_sizes(ec2: Any) -> list[VmSize]:
+def discover_aws_sizes(
+    ec2: Any, target_shapes: frozenset[tuple[int, Decimal]] = DEFAULT_TARGET_SHAPES
+) -> list[VmSize]:
     offered: set[str] = set()
     offering_pages = ec2.get_paginator("describe_instance_type_offerings").paginate(
         LocationType="region", Filters=[{"Name": "location", "Values": [AWS_REGION]}]
@@ -185,7 +187,7 @@ def discover_aws_sizes(ec2: Any) -> list[VmSize]:
     pages = ec2.get_paginator("describe_instance_types").paginate(
         Filters=[
             {"Name": "supported-usage-class", "Values": ["on-demand"]},
-            {"Name": "vcpu-info.default-vcpus", "Values": ["2", "4"]},
+            {"Name": "vcpu-info.default-vcpus", "Values": [str(value) for value in sorted({v for v, _ in target_shapes})]},
         ]
     )
     for page in pages:
@@ -194,7 +196,7 @@ def discover_aws_sizes(ec2: Any) -> list[VmSize]:
             vcpu = int(item["VCpuInfo"]["DefaultVCpus"])
             memory = decimal(item["MemoryInfo"]["SizeInMiB"], f"{name} memory") / 1024
             architectures = set(item.get("ProcessorInfo", {}).get("SupportedArchitectures", []))
-            if name in offered and "x86_64" in architectures and (vcpu, memory) in TARGET_SHAPES:
+            if name in offered and "x86_64" in architectures and (vcpu, memory) in target_shapes:
                 sizes.append(VmSize(name, vcpu, memory))
     return sorted(sizes, key=lambda item: (item.vcpu, item.name))
 
@@ -275,7 +277,9 @@ def azure_sku_restricted(item: dict[str, Any], region: str) -> bool:
     return False
 
 
-def parse_azure_sizes(items: Iterable[dict[str, Any]]) -> list[VmSize]:
+def parse_azure_sizes(
+    items: Iterable[dict[str, Any]], target_shapes: frozenset[tuple[int, Decimal]] = DEFAULT_TARGET_SHAPES
+) -> list[VmSize]:
     sizes: list[VmSize] = []
     for item in items:
         if item.get("resourceType") != "virtualMachines" or AZURE_REGION not in item.get("locations", []):
@@ -289,12 +293,14 @@ def parse_azure_sizes(items: Iterable[dict[str, Any]]) -> list[VmSize]:
             continue
         vcpu = int(capabilities["vCPUs"])
         memory = decimal(capabilities["MemoryGB"], f"Azure {item.get('name')} memory")
-        if (vcpu, memory) in TARGET_SHAPES:
+        if (vcpu, memory) in target_shapes:
             sizes.append(VmSize(item["name"], vcpu, memory))
     return sorted({size.name: size for size in sizes}.values(), key=lambda item: (item.vcpu, item.name))
 
 
-def discover_azure_sizes(session: requests.Session, subscription_id: str) -> list[VmSize]:
+def discover_azure_sizes(
+    session: requests.Session, subscription_id: str, target_shapes: frozenset[tuple[int, Decimal]]
+) -> list[VmSize]:
     credential = DefaultAzureCredential()
     token = credential.get_token("https://management.azure.com/.default").token
     url = f"https://management.azure.com/subscriptions/{subscription_id}/providers/Microsoft.Compute/skus"
@@ -303,7 +309,7 @@ def discover_azure_sizes(session: requests.Session, subscription_id: str) -> lis
     items: list[dict[str, Any]] = []
     for page in azure_pages(session, url, params=params, headers=headers):
         items.extend(page.get("value", []))
-    return parse_azure_sizes(items)
+    return parse_azure_sizes(items, target_shapes)
 
 
 def fetch_azure_retail_items(session: requests.Session, filter_query: str) -> list[dict[str, Any]]:
@@ -354,13 +360,13 @@ def select_azure_windows_prices(items: Iterable[dict[str, Any]]) -> dict[str, Pr
     return select_azure_compute_prices(items, OS_WINDOWS)
 
 
-def select_azure_rhel_license_prices(items: Iterable[dict[str, Any]]) -> dict[int, Price]:
-    grouped: dict[int, list[Price]] = {2: [], 4: []}
+def select_azure_rhel_license_prices(items: Iterable[dict[str, Any]], vcpus: Iterable[int] = (4,)) -> dict[int, Price]:
+    grouped: dict[int, list[Price]] = {vcpu: [] for vcpu in set(vcpus)}
     for item in items:
         meter_name = str(item.get("meterName", ""))
         for vcpu in grouped:
             if (
-                meter_name == f"{vcpu} vCPU VM License"
+                meter_name in {f"{vcpu} vCPU VM License", f"{vcpu}-vCPU VM License"}
                 and item.get("type") == "Consumption"
                 and item.get("unitOfMeasure") == "1 Hour"
             ):
@@ -432,10 +438,14 @@ def build_row(
 
 
 def collect_aws(
-    profile: str | None, hours: Decimal, session: requests.Session, operating_systems: Sequence[str]
+    profile: str | None,
+    hours: Decimal,
+    session: requests.Session,
+    operating_systems: Sequence[str],
+    target_shapes: frozenset[tuple[int, Decimal]],
 ) -> list[ResultRow]:
     ec2, pricing = aws_clients(profile)
-    sizes = discover_aws_sizes(ec2)
+    sizes = discover_aws_sizes(ec2, target_shapes)
     if not sizes:
         raise PricingError("AWS returned no matching x86-64 instance types in Sydney")
     aud_usd, fx_date = fetch_rba_usd_rate(session)
@@ -459,9 +469,13 @@ def collect_aws(
 
 
 def collect_azure(
-    subscription_id: str, hours: Decimal, session: requests.Session, operating_systems: Sequence[str]
+    subscription_id: str,
+    hours: Decimal,
+    session: requests.Session,
+    operating_systems: Sequence[str],
+    target_shapes: frozenset[tuple[int, Decimal]],
 ) -> list[ResultRow]:
-    sizes = discover_azure_sizes(session, subscription_id)
+    sizes = discover_azure_sizes(session, subscription_id, target_shapes)
     if not sizes:
         raise PricingError("Azure returned no matching x64 VM sizes in Australia East")
     vm_filter = f"serviceName eq 'Virtual Machines' and armRegionName eq '{AZURE_REGION}' and priceType eq 'Consumption'"
@@ -469,7 +483,9 @@ def collect_azure(
     rhel_licences: dict[int, Price] = {}
     if OS_RHEL in operating_systems:
         rhel_filter = "productName eq 'Red Hat Enterprise Linux' and priceType eq 'Consumption'"
-        rhel_licences = select_azure_rhel_license_prices(fetch_azure_retail_items(session, rhel_filter))
+        rhel_licences = select_azure_rhel_license_prices(
+            fetch_azure_retail_items(session, rhel_filter), {vcpu for vcpu, _ in target_shapes}
+        )
     disk_filter = (
         f"serviceName eq 'Storage' and armRegionName eq '{AZURE_REGION}' "
         "and productName eq 'Standard SSD Managed Disks' and priceType eq 'Consumption'"
@@ -536,9 +552,13 @@ def write_excel(rows: Sequence[ResultRow], path: Path) -> None:
     workbook.remove(workbook.active)
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(color="FFFFFF", bold=True)
+    fill_colours = ("EAF3F8", "FFF2CC", "E2F0D9", "FCE4D6", "E4DFEC", "DDEBF7")
+    shape_labels = [
+        label for _, _, label in sorted({(row.vcpu, row.memory_gib, row.vm_shape) for row in rows})
+    ]
     shape_fills = {
-        "2 vCPU / 8 GiB RAM": PatternFill("solid", fgColor="EAF3F8"),
-        "4 vCPU / 16 GiB RAM": PatternFill("solid", fgColor="FFF2CC"),
+        label: PatternFill("solid", fgColor=fill_colours[index % len(fill_colours)])
+        for index, label in enumerate(shape_labels)
     }
     group_border = Border(top=Side(style="medium", color="4472C4"))
     currency_fields = {
@@ -612,7 +632,7 @@ def write_excel(rows: Sequence[ResultRow], path: Path) -> None:
     workbook.save(path)
 
 
-def print_table(rows: Sequence[ResultRow]) -> None:
+def print_table(rows: Sequence[ResultRow], target_shapes: frozenset[tuple[int, Decimal]]) -> None:
     headers = ["Instance", "Compute/hr AUD", "Disk/mo AUD", "Total/mo AUD"]
     for provider in ("AWS", "Azure"):
         provider_rows = [row for row in rows if row.provider == provider]
@@ -626,7 +646,7 @@ def print_table(rows: Sequence[ResultRow]) -> None:
         )
         print(f"  Pricing includes VM compute, OS licensing where applicable, and one {disk_description}; no extra data disk.")
         for operating_system in ALL_OPERATING_SYSTEMS:
-            for vcpu, memory in sorted(TARGET_SHAPES):
+            for vcpu, memory in sorted(target_shapes):
                 group_rows = [
                     row for row in provider_rows
                     if row.operating_system == operating_system
@@ -651,14 +671,18 @@ def print_table(rows: Sequence[ResultRow]) -> None:
                     print("  " + "  ".join(str(value).ljust(widths[index]) for index, value in enumerate(line)))
 
 
-def cheapest_per_provider(rows: Sequence[ResultRow], limit: int) -> list[ResultRow]:
+def cheapest_per_provider(
+    rows: Sequence[ResultRow],
+    limit: int,
+    target_shapes: frozenset[tuple[int, Decimal]] = DEFAULT_TARGET_SHAPES,
+) -> list[ResultRow]:
     selected: list[ResultRow] = []
     for provider in ("AWS", "Azure"):
         operating_systems = [os_name for os_name in ALL_OPERATING_SYSTEMS if any(
             row.provider == provider and row.operating_system == os_name for row in rows
         )]
         for operating_system in operating_systems:
-            for vcpu, memory_gib in sorted(TARGET_SHAPES):
+            for vcpu, memory_gib in sorted(target_shapes):
                 shape_rows = sorted(
                     (
                         row for row in rows
@@ -673,12 +697,28 @@ def cheapest_per_provider(rows: Sequence[ResultRow], limit: int) -> list[ResultR
     return selected
 
 
+def parse_shape(value: str) -> tuple[int, Decimal]:
+    try:
+        vcpu_text, memory_text = value.split(":", 1)
+        vcpu = int(vcpu_text)
+        memory = Decimal(memory_text)
+    except (ValueError, InvalidOperation) as exc:
+        raise argparse.ArgumentTypeError("shape must use VCPU:RAM_GIB, for example 8:32") from exc
+    if vcpu <= 0 or memory <= 0 or not memory.is_finite():
+        raise argparse.ArgumentTypeError("shape vCPU and RAM values must be positive")
+    return vcpu, memory.normalize()
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--aws-profile", help="AWS shared-config profile (default: normal credential chain)")
     parser.add_argument("--azure-subscription-id", default=os.getenv("AZURE_SUBSCRIPTION_ID"))
     parser.add_argument("--output", type=Path, default=Path("vm_pricing_aud.xlsx"))
     parser.add_argument("--hours-per-month", type=Decimal, default=DEFAULT_HOURS)
+    parser.add_argument(
+        "--shape", action="append", type=parse_shape, metavar="VCPU:RAM_GIB",
+        help="Exact VM build to query; repeat for multiple builds (default: 4:16)",
+    )
     parser.add_argument(
         "--top", type=int, default=5,
         help="Cheapest rows per provider, OS, and VM shape (default: 5)",
@@ -709,11 +749,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     session = http_session()
     os_choices = {"windows": OS_WINDOWS, "linux": OS_LINUX, "rhel": OS_RHEL}
     operating_systems = ALL_OPERATING_SYSTEMS if args.os == "all" else (os_choices[args.os],)
+    target_shapes = frozenset(args.shape or DEFAULT_TARGET_SHAPES)
     rows: list[ResultRow] = []
     failures: list[str] = []
     collectors = (
-        ("AWS", lambda: collect_aws(args.aws_profile, args.hours_per_month, session, operating_systems)),
-        ("Azure", lambda: collect_azure(args.azure_subscription_id, args.hours_per_month, session, operating_systems)),
+        ("AWS", lambda: collect_aws(
+            args.aws_profile, args.hours_per_month, session, operating_systems, target_shapes
+        )),
+        ("Azure", lambda: collect_azure(
+            args.azure_subscription_id, args.hours_per_month, session, operating_systems, target_shapes
+        )),
     )
     for provider, collect in collectors:
         try:
@@ -727,9 +772,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("Pricing collection failed:\n  " + "\n  ".join(failures), file=sys.stderr)
         return 1
     rows.sort(key=lambda row: (row.total_monthly_aud, row.provider, row.instance_type))
-    rows = cheapest_per_provider(rows, args.top)
+    rows = cheapest_per_provider(rows, args.top, target_shapes)
     write_excel(rows, args.output)
-    print_table(rows)
+    print_table(rows, target_shapes)
     print(f"\nWrote {len(rows)} rows to {args.output}")
     print(f"Retrieved at {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
     if failures:
