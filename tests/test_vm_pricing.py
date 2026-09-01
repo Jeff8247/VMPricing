@@ -148,10 +148,12 @@ class PricingTests(unittest.TestCase):
             write_excel([aws, azure], path)
             workbook = load_workbook(path)
             self.assertEqual(workbook.sheetnames, ["AWS", "Azure"])
-            self.assertEqual(workbook["AWS"]["C2"].value, "2 vCPU / 8 GiB RAM")
-            self.assertEqual(workbook["AWS"]["E2"].value, "m.test")
-            self.assertIsInstance(workbook["AWS"]["H2"].value, float)
-            self.assertEqual(workbook["AWS"].freeze_panes, "A2")
+            self.assertIn("one separate 128 GiB gp3", workbook["AWS"]["A1"].value)
+            self.assertIn("one separate 128 GiB Standard SSD LRS", workbook["Azure"]["A1"].value)
+            self.assertEqual(workbook["AWS"]["C4"].value, "2 vCPU / 8 GiB RAM")
+            self.assertEqual(workbook["AWS"]["E4"].value, "m.test")
+            self.assertIsInstance(workbook["AWS"]["H4"].value, float)
+            self.assertEqual(workbook["AWS"].freeze_panes, "A4")
 
     def test_top_limit_is_applied_per_provider(self):
         rows = []

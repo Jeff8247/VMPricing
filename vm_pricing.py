@@ -19,6 +19,7 @@ from azure.identity import DefaultAzureCredential
 from botocore.config import Config
 from openpyxl import Workbook
 from openpyxl.styles import Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 
@@ -548,8 +549,19 @@ def write_excel(rows: Sequence[ResultRow], path: Path) -> None:
         sheet = workbook.create_sheet(provider)
         provider_rows = [row for row in rows if row.provider == provider]
         headers = [heading for heading, _ in EXCEL_COLUMNS]
+        disk_description = (
+            "one separate 128 GiB gp3 EBS volume"
+            if provider == "AWS"
+            else "one separate 128 GiB Standard SSD LRS managed disk (E10)"
+        )
+        sheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+        note = sheet.cell(1, 1, f"Pricing basis: VM compute and OS licensing (where applicable) plus {disk_description}.")
+        note.font = Font(bold=True, color="1F1F1F")
+        note.fill = PatternFill("solid", fgColor="D9EAD3")
+        sheet.row_dimensions[1].height = 24
+        sheet.append([])
         sheet.append(headers)
-        for cell in sheet[1]:
+        for cell in sheet[3]:
             cell.fill = header_fill
             cell.font = header_font
         for row in provider_rows:
@@ -557,7 +569,7 @@ def write_excel(rows: Sequence[ResultRow], path: Path) -> None:
             sheet.append([excel_value(values[field]) for _, field in EXCEL_COLUMNS])
 
         previous_group: tuple[str, str] | None = None
-        for row_index, row in enumerate(provider_rows, start=2):
+        for row_index, row in enumerate(provider_rows, start=4):
             group = (row.operating_system, row.vm_shape)
             fill = shape_fills.get(row.vm_shape)
             for cell in sheet[row_index]:
@@ -568,26 +580,27 @@ def write_excel(rows: Sequence[ResultRow], path: Path) -> None:
                     cell.font = Font(bold=True)
             previous_group = group
 
-        sheet.freeze_panes = "A2"
-        sheet.auto_filter.ref = sheet.dimensions
+        sheet.freeze_panes = "A4"
+        table_end_row = 3 + len(provider_rows)
+        table_ref = f"A3:{sheet.cell(table_end_row, len(headers)).coordinate}"
+        sheet.auto_filter.ref = table_ref
         sheet.sheet_view.showGridLines = False
-        sheet.row_dimensions[1].height = 24
         for column_index, (heading, field) in enumerate(EXCEL_COLUMNS, start=1):
-            letter = sheet.cell(1, column_index).column_letter
-            observed = [heading, *(str(sheet.cell(row, column_index).value or "") for row in range(2, sheet.max_row + 1))]
+            letter = get_column_letter(column_index)
+            observed = [heading, *(str(sheet.cell(row, column_index).value or "") for row in range(4, sheet.max_row + 1))]
             sheet.column_dimensions[letter].width = min(max(len(value) for value in observed) + 2, 42)
             if field in currency_fields:
-                for row_index in range(2, sheet.max_row + 1):
+                for row_index in range(4, sheet.max_row + 1):
                     sheet.cell(row_index, column_index).number_format = 'A$0.000000'
             elif field == "memory_gib":
-                for row_index in range(2, sheet.max_row + 1):
+                for row_index in range(4, sheet.max_row + 1):
                     sheet.cell(row_index, column_index).number_format = '0.##'
             elif field == "fx_aud_usd":
-                for row_index in range(2, sheet.max_row + 1):
+                for row_index in range(4, sheet.max_row + 1):
                     sheet.cell(row_index, column_index).number_format = '0.000000'
 
         if provider_rows:
-            table = Table(displayName=f"{provider}Pricing", ref=sheet.dimensions)
+            table = Table(displayName=f"{provider}Pricing", ref=table_ref)
             table.tableStyleInfo = TableStyleInfo(
                 name="TableStyleMedium2", showFirstColumn=False, showLastColumn=False,
                 showRowStripes=True, showColumnStripes=False,
@@ -603,6 +616,8 @@ def print_table(rows: Sequence[ResultRow]) -> None:
         if not provider_rows:
             continue
         print(f"\n{provider}")
+        disk_description = "128 GiB gp3 EBS" if provider == "AWS" else "128 GiB Standard SSD LRS (E10)"
+        print(f"  Pricing includes VM compute, OS licensing where applicable, and one separate {disk_description} disk.")
         for operating_system in ALL_OPERATING_SYSTEMS:
             for vcpu, memory in sorted(TARGET_SHAPES):
                 group_rows = [
