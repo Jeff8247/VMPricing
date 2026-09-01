@@ -11,7 +11,7 @@ The comparison uses:
 - Azure's AUD retail catalog prices. AWS catalog prices are converted from USD with the latest AUD/USD observation published by the Reserve Bank of Australia.
 - 730 hours per month by default.
 
-> **Disk is included in every total:** each AWS row adds one separate 128 GiB gp3 EBS volume, and each Azure row adds one separate 128 GiB Standard SSD LRS managed disk (E10). These are not assumed to be bundled into the VM compute rate; the report adds their provisioned monthly cost to the compute and applicable OS-licensing cost.
+> **The root/OS disk is included in every total:** each AWS row adds one 128 GiB gp3 EBS root volume, and each Azure row adds one 128 GiB Standard SSD LRS managed OS disk (E10). Persistent OS-disk storage is billed separately from VM compute, so the report adds its provisioned monthly cost. It does **not** add a second data disk. Temporary/local instance storage, where offered, is already included by the provider but is not persistent.
 
 Spot, reservations, savings plans, SQL Server, Azure Hybrid Benefit, Dev/Test rates, GST, network traffic, backups, snapshots, support, negotiated discounts, and Azure Standard SSD transaction charges are excluded.
 

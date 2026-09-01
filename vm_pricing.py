@@ -550,12 +550,15 @@ def write_excel(rows: Sequence[ResultRow], path: Path) -> None:
         provider_rows = [row for row in rows if row.provider == provider]
         headers = [heading for heading, _ in EXCEL_COLUMNS]
         disk_description = (
-            "one separate 128 GiB gp3 EBS volume"
+            "one 128 GiB gp3 EBS root/OS volume"
             if provider == "AWS"
-            else "one separate 128 GiB Standard SSD LRS managed disk (E10)"
+            else "one 128 GiB Standard SSD LRS managed OS disk (E10)"
         )
         sheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
-        note = sheet.cell(1, 1, f"Pricing basis: VM compute and OS licensing (where applicable) plus {disk_description}.")
+        note = sheet.cell(
+            1, 1,
+            f"Pricing basis: VM compute and OS licensing (where applicable) plus {disk_description}; no extra data disk.",
+        )
         note.font = Font(bold=True, color="1F1F1F")
         note.fill = PatternFill("solid", fgColor="D9EAD3")
         sheet.row_dimensions[1].height = 24
@@ -616,8 +619,12 @@ def print_table(rows: Sequence[ResultRow]) -> None:
         if not provider_rows:
             continue
         print(f"\n{provider}")
-        disk_description = "128 GiB gp3 EBS" if provider == "AWS" else "128 GiB Standard SSD LRS (E10)"
-        print(f"  Pricing includes VM compute, OS licensing where applicable, and one separate {disk_description} disk.")
+        disk_description = (
+            "128 GiB gp3 EBS root/OS volume"
+            if provider == "AWS"
+            else "128 GiB Standard SSD LRS managed OS disk (E10)"
+        )
+        print(f"  Pricing includes VM compute, OS licensing where applicable, and one {disk_description}; no extra data disk.")
         for operating_system in ALL_OPERATING_SYSTEMS:
             for vcpu, memory in sorted(TARGET_SHAPES):
                 group_rows = [
