@@ -110,6 +110,43 @@ The default estimate assumes **50% of each disk is used** and **2% of used data 
 
 AWS uses the live Sydney standard EBS snapshot storage rate, converted to AUD, for same-region snapshots. Azure uses the live Australia East Azure VM protected-instance meter plus Standard **ZRS** vault storage by default. Use `--backup-redundancy lrs` for locally redundant Azure vault storage; AWS stays in the same region. The workbook shows estimated retained GiB, monthly backup cost, and the assumptions. SQL database-specific backups and transaction-log backups, instant-restore snapshots, restores, and cross-region copies are not included.
 
+### Example output
+
+The following is a sample run from 23 September 2026. It includes backup costs but no SQL Server licence because `--sql` was not selected. Live prices and the cheapest VM sizes can change.
+
+```text
+$ .venv/bin/python vm_pricing.py --os windows --shape 4:32 --disk 1024 --backup
+
+AWS
+  Pricing includes VM compute, OS licensing where applicable; one 128 GiB gp3 EBS root/OS volume; data disks: 1 x 1024 GiB gp3.
+  Backup: Standard EBS snapshots, same region; 50% used, 2% changed/day; 14 daily, 4 weekly, 3 monthly; estimated stored data 1612.8 GiB.
+
+  Windows — 4 vCPU / 32 GiB RAM
+  Instance         Compute/hr AUD  SQL/hr AUD  OS disk/mo AUD  Data disks/mo AUD  Backup/mo AUD  Total/mo AUD
+  ---------------  --------------  ----------  --------------  -----------------  -------------  ------------
+  r6a.xlarge       0.6399          0.0000      17.25           138.01             124.53         746.92
+  r5a.xlarge       0.6402          0.0000      17.25           138.01             124.53         747.12
+  r5.xlarge        0.6823          0.0000      17.25           138.01             124.53         777.87
+  r6i.xlarge       0.6823          0.0000      17.25           138.01             124.53         777.87
+  r8i-flex.xlarge  0.6895          0.0000      17.25           138.01             124.53         783.12
+
+Azure
+  Pricing includes VM compute, OS licensing where applicable; one 128 GiB Standard SSD LRS managed OS disk (E10); data disks: 1 x 1024 GiB Standard SSD LRS (E30).
+  Backup: Azure VM Backup, same-region ZRS; 50% used, 2% changed/day; 14 daily, 4 weekly, 3 monthly; estimated stored data 1612.8 GiB.
+
+  Windows — 4 vCPU / 32 GiB RAM
+  Instance          Compute/hr AUD  SQL/hr AUD  OS disk/mo AUD  Data disks/mo AUD  Backup/mo AUD  Total/mo AUD
+  ----------------  --------------  ----------  --------------  -----------------  -------------  ------------
+  Standard_E4as_v5  0.6341          0.0000      18.15           145.24             96.88          723.16
+  Standard_A4m_v2   0.6396          0.0000      18.15           145.24             96.88          727.22
+  Standard_E4as_v6  0.6730          0.0000      18.15           145.24             96.88          751.58
+  Standard_E4as_v7  0.6730          0.0000      18.15           145.24             96.88          751.58
+  Standard_E4_v4    0.6758          0.0000      18.15           145.24             96.88          753.61
+
+Wrote 10 rows to vm_pricing_aud.xlsx
+Retrieved at 2026-09-23T03:54:51+00:00
+```
+
 Each provider worksheet shows the top results for every selected OS separately and labels every row. Azure RHEL totals combine the standard Linux compute meter with Azure's separate vCPU-based RHEL PAYG licence meter; AWS uses its RHEL-included EC2 rate.
 
 By default, a provider failure prevents a partial workbook from being written. Pass `--allow-partial` to retain results from the provider that succeeds; warnings are printed to stderr.
