@@ -11,9 +11,9 @@ The comparison uses:
 - Azure's AUD retail catalog prices. AWS catalog prices are converted from USD with the latest AUD/USD observation published by the Reserve Bank of Australia.
 - 730 hours per month by default.
 
-> **The root/OS disk is included in every total:** each AWS row adds one 128 GiB gp3 EBS root volume, and each Azure row adds one 128 GiB Standard SSD LRS managed OS disk (E10). Persistent OS-disk storage is billed separately from VM compute, so the report adds its provisioned monthly cost. It does **not** add a second data disk. Temporary/local instance storage, where offered, is already included by the provider but is not persistent.
+> **The root/OS disk is included in every total:** each AWS row adds one 128 GiB gp3 EBS root volume, and each Azure row adds one 128 GiB Standard SSD LRS managed OS disk (E10). Persistent OS-disk storage is billed separately from VM compute, so the report adds its provisioned monthly cost. Extra data disks are included when requested with `--disk`. Temporary/local instance storage, where offered, is already included by the provider but is not persistent.
 
-Spot, reservations, savings plans, SQL Server, Azure Hybrid Benefit, Dev/Test rates, GST, network traffic, backups, snapshots, support, negotiated discounts, and Azure Standard SSD transaction charges are excluded.
+Spot, reservations, savings plans, Azure Hybrid Benefit, Dev/Test rates, GST, network traffic, support, negotiated discounts, and Azure Standard SSD transaction charges are excluded. SQL Server and VM backup costs are included only when requested with `--sql` and `--backup`.
 
 An x86-64 VM type is also excluded when the provider has no standard Windows Server PAYG meter for it. This commonly applies to specialised accelerator types even when their CPU and memory match a target shape.
 
@@ -63,7 +63,21 @@ python vm_pricing.py --shape 8:32
 python vm_pricing.py --shape 2:8 --shape 8:32
 ```
 
+For Azure constrained-vCPU sizes, the vCPU value means **available** vCPUs. For example, an `E4-2...` size has 2 available vCPUs, so it will not appear in a `--shape 4:32` comparison.
+
 Change the number of results per provider, OS, and VM shape with `--top`, for example `--top 10`. With the default three OS categories and one VM shape, the workbook can contain up to 15 rows on each provider worksheet.
+
+Add data disks with repeatable `--disk` arguments. Sizes are in GiB; `1024` GiB is 1 TiB. Each argument accepts either `SIZE_GIB` (one disk) or `COUNTxSIZE_GIB` (several identical disks). The 128 GiB OS disk is always included separately:
+
+```bash
+# 4 vCPU / 32 GiB RAM, 128 GiB OS disk, and one 1 TiB data disk
+python vm_pricing.py --shape 4:32 --disk 1024
+
+# The same OS disk, two 1 TiB data disks, and one 512 GiB data disk
+python vm_pricing.py --shape 4:32 --disk 2x1024 --disk 512
+```
+
+AWS data disks use gp3 pricing per provisioned GiB. Azure data disks use Standard SSD LRS pricing: each requested size is billed at its next supported E tier (for example, 1,024 GiB uses E30). The console and workbook show OS and data disk costs separately, and both are included in the total. Disk transaction charges and VM disk attachment limits are not evaluated.
 
 All three operating-system costs are included by default. Select only one when required with:
 
@@ -73,6 +87,28 @@ python vm_pricing.py --os linux
 python vm_pricing.py --os rhel
 python vm_pricing.py --os all
 ```
+
+Add a pay-as-you-go SQL Server licence to a Windows VM with `--sql web`, `--sql standard`, or `--sql enterprise`. This can be combined with extra data disks:
+
+```bash
+.venv/bin/python vm_pricing.py --os windows --shape 4:32 --disk 1024 --sql standard
+```
+
+The `--sql` switch requires `--os windows`. AWS uses the licence-included Windows plus SQL Server On-Demand rate and shows the SQL increment over the Windows-only rate separately. Azure adds its SQL Server VM licence meter to the Windows VM rate. The workbook and console show SQL licensing per hour and include it in the monthly total. This estimates one SQL Server VM with a provider-supplied licence; it does not model bring-your-own-licence, Azure Hybrid Benefit, reservations, SQL Server CAL licensing, or high-availability replicas. SQL Server Web edition has restricted permitted workloads; check its licence terms before choosing it.
+
+Estimate same-region VM backup costs with `--backup`. The model retains 14 daily, 4 weekly, and 3 monthly restore points. It includes the 128 GiB OS disk and every requested data disk:
+
+```bash
+.venv/bin/python vm_pricing.py --os windows --shape 4:32 --disk 1024 --sql standard --backup
+
+# Override the usage assumptions: 70% of each disk used, 5% of used data changed daily
+.venv/bin/python vm_pricing.py --os windows --shape 4:32 --disk 1024 --sql standard \
+  --backup --backup-used-pct 70 --backup-daily-change-pct 5
+```
+
+The default estimate assumes **50% of each disk is used** and **2% of used data changes each day**. It treats the weekly and monthly points as additional retained restore points, with the oldest monthly point 90 days old. Storage is estimated as one full used-data copy plus the distinct changed blocks needed between retained points; each interval's change is capped at the used size of its disk. This is a capacity estimate, because actual changed-block reuse and compression vary by workload.
+
+AWS uses the live Sydney standard EBS snapshot storage rate, converted to AUD, for same-region snapshots. Azure uses the live Australia East Azure VM protected-instance meter plus Standard **ZRS** vault storage by default. Use `--backup-redundancy lrs` for locally redundant Azure vault storage; AWS stays in the same region. The workbook shows estimated retained GiB, monthly backup cost, and the assumptions. SQL database-specific backups and transaction-log backups, instant-restore snapshots, restores, and cross-region copies are not included.
 
 Each provider worksheet shows the top results for every selected OS separately and labels every row. Azure RHEL totals combine the standard Linux compute meter with Azure's separate vCPU-based RHEL PAYG licence meter; AWS uses its RHEL-included EC2 rate.
 

@@ -5,11 +5,12 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
@@ -35,6 +36,21 @@ OS_WINDOWS = "Windows"
 OS_LINUX = "Linux (Ubuntu/Debian)"
 OS_RHEL = "Red Hat Enterprise Linux"
 ALL_OPERATING_SYSTEMS = (OS_WINDOWS, OS_LINUX, OS_RHEL)
+SQL_EDITIONS = ("web", "standard", "enterprise")
+AWS_SQL_CATALOG = {
+    "web": ("SQL Web", "RunInstances:0202"),
+    "standard": ("SQL Std", "RunInstances:0006"),
+    "enterprise": ("SQL Ent", "RunInstances:0102"),
+}
+AZURE_STANDARD_SSD_TIERS = (
+    (4, "E1"), (8, "E2"), (16, "E3"), (32, "E4"), (64, "E6"),
+    (128, "E10"), (256, "E15"), (512, "E20"), (1024, "E30"),
+    (2048, "E40"), (4096, "E50"), (8192, "E60"),
+    (16384, "E70"), (32767, "E80"),
+)
+BACKUP_POINT_AGES = tuple(sorted({*range(14), 14, 21, 28, 35, 30, 60, 90}))
+DEFAULT_BACKUP_USED_PCT = Decimal("50")
+DEFAULT_BACKUP_DAILY_CHANGE_PCT = Decimal("2")
 
 
 class PricingError(RuntimeError):
@@ -55,6 +71,13 @@ class Price:
     effective_end_date: str = ""
 
 
+@dataclass(frozen=True)
+class BackupConfig:
+    used_pct: Decimal
+    daily_change_pct: Decimal
+    redundancy: str = "zrs"
+
+
 @dataclass
 class ResultRow:
     provider: str
@@ -63,8 +86,15 @@ class ResultRow:
     vcpu: int
     memory_gib: Decimal
     compute_hourly_aud: Decimal
+    sql_edition: str
+    sql_hourly_aud: Decimal
     disk: str
     disk_monthly_aud: Decimal
+    data_disks: str
+    data_disks_monthly_aud: Decimal
+    backup: str
+    backup_storage_gib: Decimal
+    backup_monthly_aud: Decimal
     total_hourly_aud: Decimal
     total_monthly_aud: Decimal
     currency: str
@@ -225,26 +255,34 @@ def aws_ondemand_price(product: dict[str, Any], expected_unit: str) -> Price | N
     return select_current_price(found, "AWS on-demand product")
 
 
-def fetch_aws_compute_price(pricing: Any, instance_type: str, operating_system: str = OS_WINDOWS) -> Price | None:
+def fetch_aws_compute_price(
+    pricing: Any, instance_type: str, operating_system: str = OS_WINDOWS,
+    sql_edition: str | None = None,
+) -> Price | None:
+    if sql_edition and operating_system != OS_WINDOWS:
+        raise PricingError("SQL Server licence-included pricing requires Windows")
     aws_os = {OS_WINDOWS: "Windows", OS_LINUX: "Linux", OS_RHEL: "RHEL"}[operating_system]
+    preinstalled, operation = (
+        AWS_SQL_CATALOG[sql_edition] if sql_edition else
+        ("NA", {OS_WINDOWS: "RunInstances:0002", OS_LINUX: "RunInstances", OS_RHEL: "RunInstances:0010"}[operating_system])
+    )
     filters = [
         {"Type": "TERM_MATCH", "Field": "regionCode", "Value": AWS_REGION},
         {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Compute Instance"},
         {"Type": "TERM_MATCH", "Field": "instanceType", "Value": instance_type},
         {"Type": "TERM_MATCH", "Field": "operatingSystem", "Value": aws_os},
         {"Type": "TERM_MATCH", "Field": "tenancy", "Value": "Shared"},
-        {"Type": "TERM_MATCH", "Field": "preInstalledSw", "Value": "NA"},
+        {"Type": "TERM_MATCH", "Field": "preInstalledSw", "Value": preinstalled},
         {"Type": "TERM_MATCH", "Field": "capacitystatus", "Value": "Used"},
     ]
-    operation = {OS_WINDOWS: "RunInstances:0002", OS_LINUX: "RunInstances", OS_RHEL: "RunInstances:0010"}
-    filters.append({"Type": "TERM_MATCH", "Field": "operation", "Value": operation[operating_system]})
+    filters.append({"Type": "TERM_MATCH", "Field": "operation", "Value": operation})
     prices = [price for product in aws_products(pricing, filters) if (price := aws_ondemand_price(product, "Hrs"))]
     if not prices:
         # Some x86-64 accelerator types (for example AWS Inferentia) match the
         # requested hardware shape but do not support Windows Server. The live
         # catalog's lack of a Windows meter is the authoritative exclusion.
         return None
-    return select_current_price(prices, f"AWS {instance_type} {operating_system}")
+    return select_current_price(prices, f"AWS {instance_type} {operating_system} {sql_edition or ''}")
 
 
 def fetch_aws_gp3_price(pricing: Any) -> Price:
@@ -257,6 +295,22 @@ def fetch_aws_gp3_price(pricing: Any) -> Price:
     if not prices:
         raise PricingError("No AWS gp3 storage rate")
     return select_current_price(prices, "AWS gp3 storage")
+
+
+def fetch_aws_snapshot_price(pricing: Any) -> Price:
+    filters = [
+        {"Type": "TERM_MATCH", "Field": "regionCode", "Value": AWS_REGION},
+        {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Storage Snapshot"},
+        {"Type": "TERM_MATCH", "Field": "usagetype", "Value": "APS2-EBS:SnapshotUsage"},
+    ]
+    prices = [
+        price for product in aws_products(pricing, filters)
+        if product.get("product", {}).get("attributes", {}).get("usagetype") == "APS2-EBS:SnapshotUsage"
+        if (price := aws_ondemand_price(product, "GB-Mo"))
+    ]
+    if not prices:
+        raise PricingError("No AWS Sydney standard EBS snapshot storage rate")
+    return select_current_price(prices, "AWS Sydney standard EBS snapshot storage")
 
 
 def azure_pages(session: requests.Session, url: str, **kwargs: Any) -> Iterator[dict[str, Any]]:
@@ -291,10 +345,15 @@ def parse_azure_sizes(
             continue
         if "vCPUs" not in capabilities or "MemoryGB" not in capabilities:
             continue
-        vcpu = int(capabilities["vCPUs"])
+        name = item["name"]
+        if "vCPUsAvailable" not in capabilities and re.search(r"-\d+", name):
+            # Constrained SKUs report the parent size in vCPUs. Without the
+            # available count, their exact usable CPU shape is unknown.
+            continue
+        vcpu = int(capabilities.get("vCPUsAvailable") or capabilities["vCPUs"])
         memory = decimal(capabilities["MemoryGB"], f"Azure {item.get('name')} memory")
         if (vcpu, memory) in target_shapes:
-            sizes.append(VmSize(item["name"], vcpu, memory))
+            sizes.append(VmSize(name, vcpu, memory))
     return sorted({size.name: size for size in sizes}.values(), key=lambda item: (item.vcpu, item.name))
 
 
@@ -383,24 +442,113 @@ def select_azure_rhel_license_prices(items: Iterable[dict[str, Any]], vcpus: Ite
     }
 
 
-def select_azure_e10_price(items: Iterable[dict[str, Any]]) -> Price:
+def select_azure_sql_license_prices(
+    items: Iterable[dict[str, Any]], edition: str, vcpus: Iterable[int]
+) -> dict[int, Price]:
+    requested = set(vcpus)
+    grouped: dict[int, list[Price]] = {vcpu: [] for vcpu in requested}
+    for item in items:
+        if (
+            item.get("productName") != f"SQL Server {edition.title()}"
+            or item.get("serviceName") != "Virtual Machines Licenses"
+            or item.get("type") != "Consumption"
+            or item.get("unitOfMeasure") != "1 Hour"
+        ):
+            continue
+        for vcpu in requested:
+            meter = "1-4 vCPU VM License" if vcpu <= 4 else f"{vcpu} vCPU VM License"
+            if item.get("meterName") == meter:
+                grouped[vcpu].append(Price(
+                    decimal(item.get("retailPrice"), f"Azure SQL Server {edition} {vcpu} vCPU licence"),
+                    str(item.get("effectiveStartDate") or "")[:10],
+                    str(item.get("effectiveEndDate") or "")[:10],
+                ))
+    return {
+        vcpu: select_current_price(prices, f"Azure SQL Server {edition} {vcpu} vCPU licence")
+        for vcpu, prices in grouped.items()
+    }
+
+
+def select_azure_disk_price(items: Iterable[dict[str, Any]], tier: str) -> Price:
     prices: list[Price] = []
     for item in items:
         if (
             item.get("type") == "Consumption"
-            and item.get("meterName") == "E10 LRS Disk"
+            and item.get("meterName") == f"{tier} LRS Disk"
             and item.get("unitOfMeasure") in {"1/Month", "1 Month"}
         ):
             prices.append(
                 Price(
-                    decimal(item.get("retailPrice"), "Azure E10 price"),
+                    decimal(item.get("retailPrice"), f"Azure {tier} price"),
                     str(item.get("effectiveStartDate") or "")[:10],
                     str(item.get("effectiveEndDate") or "")[:10],
                 )
             )
     if not prices:
-        raise PricingError("No Azure E10 LRS disk rate")
-    return select_current_price(prices, "Azure E10 LRS disk")
+        raise PricingError(f"No Azure {tier} LRS disk rate")
+    return select_current_price(prices, f"Azure {tier} LRS disk")
+
+
+def select_azure_e10_price(items: Iterable[dict[str, Any]]) -> Price:
+    return select_azure_disk_price(items, "E10")
+
+
+def select_azure_backup_price(items: Iterable[dict[str, Any]], meter: str, unit: str) -> Price:
+    prices = [
+        Price(
+            decimal(item.get("retailPrice"), f"Azure Backup {meter}"),
+            str(item.get("effectiveStartDate") or "")[:10],
+            str(item.get("effectiveEndDate") or "")[:10],
+        )
+        for item in items
+        if item.get("productName") == "Backup"
+        and item.get("meterName") == meter
+        and item.get("unitOfMeasure") == unit
+        and item.get("type") == "Consumption"
+        and item.get("armRegionName") == AZURE_REGION
+    ]
+    if not prices:
+        raise PricingError(f"No Azure Backup {meter} rate in Australia East")
+    return select_current_price(prices, f"Azure Backup {meter}")
+
+
+def estimated_backup_storage_gib(
+    volumes: Sequence[tuple[int, int]], used_pct: Decimal, daily_change_pct: Decimal
+) -> Decimal:
+    """Estimate distinct retained blocks across the requested restore points."""
+    total = Decimal("0")
+    gaps = [newer - older for older, newer in zip(BACKUP_POINT_AGES, BACKUP_POINT_AGES[1:])]
+    for count, size in volumes:
+        used = Decimal(size) * used_pct / 100
+        daily_change = used * daily_change_pct / 100
+        total += count * (used + sum((min(used, daily_change * gap) for gap in gaps), Decimal("0")))
+    return total
+
+
+def azure_backup_protected_units(used_gib: Decimal) -> Decimal:
+    if used_gib <= 0:
+        return Decimal("0")
+    if used_gib <= 50:
+        return Decimal("0.5")
+    return (used_gib / 500).to_integral_value(rounding=ROUND_CEILING)
+
+
+def azure_disk_tier(size_gib: int) -> str:
+    for tier_size, tier in AZURE_STANDARD_SSD_TIERS:
+        if size_gib <= tier_size:
+            return tier
+    raise PricingError(f"Azure Standard SSD does not support a {size_gib} GiB disk")
+
+
+def describe_data_disks(disks: Sequence[tuple[int, int]], provider: str) -> str:
+    if not disks:
+        return "None"
+    if provider == "AWS":
+        return "; ".join(f"{count} x {size} GiB gp3" for count, size in disks)
+    return "; ".join(
+        f"{count} x {size} GiB Standard SSD LRS ({azure_disk_tier(size)})"
+        for count, size in disks
+    )
 
 
 def build_row(
@@ -415,8 +563,16 @@ def build_row(
     fx_rate: str = "",
     fx_date: str = "",
     operating_system: str = OS_WINDOWS,
+    data_disks: str = "None",
+    data_disks_monthly: Decimal = Decimal("0"),
+    sql_edition: str = "None",
+    sql_hourly: Decimal = Decimal("0"),
+    backup: str = "None",
+    backup_storage_gib: Decimal = Decimal("0"),
+    backup_monthly: Decimal = Decimal("0"),
 ) -> ResultRow:
-    total_monthly = compute_hourly * hours + disk_monthly
+    total_disk_monthly = disk_monthly + data_disks_monthly
+    total_monthly = (compute_hourly + sql_hourly) * hours + total_disk_monthly + backup_monthly
     return ResultRow(
         provider=provider,
         region=region,
@@ -424,9 +580,16 @@ def build_row(
         vcpu=size.vcpu,
         memory_gib=size.memory_gib,
         compute_hourly_aud=compute_hourly,
+        sql_edition=sql_edition,
+        sql_hourly_aud=sql_hourly,
         disk=disk_name,
         disk_monthly_aud=disk_monthly,
-        total_hourly_aud=compute_hourly + disk_monthly / hours,
+        data_disks=data_disks,
+        data_disks_monthly_aud=data_disks_monthly,
+        backup=backup,
+        backup_storage_gib=backup_storage_gib,
+        backup_monthly_aud=backup_monthly,
+        total_hourly_aud=compute_hourly + sql_hourly + (total_disk_monthly + backup_monthly) / hours,
         total_monthly_aud=total_monthly,
         currency="AUD",
         pricing_effective_date=effective_date,
@@ -443,6 +606,9 @@ def collect_aws(
     session: requests.Session,
     operating_systems: Sequence[str],
     target_shapes: frozenset[tuple[int, Decimal]],
+    data_disks: Sequence[tuple[int, int]] = (),
+    sql_edition: str | None = None,
+    backup: BackupConfig | None = None,
 ) -> list[ResultRow]:
     ec2, pricing = aws_clients(profile)
     sizes = discover_aws_sizes(ec2, target_shapes)
@@ -451,16 +617,43 @@ def collect_aws(
     aud_usd, fx_date = fetch_rba_usd_rate(session)
     gp3 = fetch_aws_gp3_price(pricing)
     disk_monthly_aud = gp3.value * 128 / aud_usd
+    data_disk_monthly_aud = gp3.value * sum(count * size for count, size in data_disks) / aud_usd
+    data_disk_description = describe_data_disks(data_disks, "AWS")
+    backup_storage_gib = Decimal("0")
+    backup_monthly_aud = Decimal("0")
+    if backup:
+        backup_storage_gib = estimated_backup_storage_gib(
+            [(1, 128), *data_disks],
+            backup.used_pct, backup.daily_change_pct,
+        )
+        backup_monthly_aud = backup_storage_gib * fetch_aws_snapshot_price(pricing).value / aud_usd
     rows: list[ResultRow] = []
     for operating_system in operating_systems:
         for size in sizes:
             compute = fetch_aws_compute_price(pricing, size.name, operating_system)
             if compute is None:
                 continue
+            sql_hourly = Decimal("0")
+            effective_date = compute.effective_date
+            if sql_edition:
+                sql_included = fetch_aws_compute_price(pricing, size.name, operating_system, sql_edition)
+                if sql_included is None:
+                    continue
+                sql_hourly = sql_included.value - compute.value
+                if sql_hourly < 0:
+                    raise PricingError(f"AWS {size.name} SQL-inclusive rate is below its Windows rate")
+                effective_date = max(effective_date, sql_included.effective_date)
             rows.append(
                 build_row(
                     "AWS", AWS_REGION, size, compute.value / aud_usd, "128 GiB gp3", disk_monthly_aud,
-                    hours, compute.effective_date, str(aud_usd), fx_date, operating_system,
+                    hours, effective_date, str(aud_usd), fx_date, operating_system,
+                    data_disk_description, data_disk_monthly_aud,
+                    sql_edition.title() if sql_edition else "None", sql_hourly / aud_usd,
+                    (
+                        f"Standard EBS snapshots, same region; {display_value(backup.used_pct)}% used, "
+                        f"{display_value(backup.daily_change_pct)}% changed/day"
+                    ) if backup else "None",
+                    backup_storage_gib, backup_monthly_aud,
                 )
             )
     if not rows:
@@ -474,6 +667,9 @@ def collect_azure(
     session: requests.Session,
     operating_systems: Sequence[str],
     target_shapes: frozenset[tuple[int, Decimal]],
+    data_disks: Sequence[tuple[int, int]] = (),
+    sql_edition: str | None = None,
+    backup: BackupConfig | None = None,
 ) -> list[ResultRow]:
     sizes = discover_azure_sizes(session, subscription_id, target_shapes)
     if not sizes:
@@ -486,11 +682,56 @@ def collect_azure(
         rhel_licences = select_azure_rhel_license_prices(
             fetch_azure_retail_items(session, rhel_filter), {vcpu for vcpu, _ in target_shapes}
         )
+    sql_licences: dict[int, Price] = {}
+    if sql_edition:
+        sql_filter = (
+            "serviceName eq 'Virtual Machines Licenses' and "
+            f"productName eq 'SQL Server {sql_edition.title()}' and priceType eq 'Consumption'"
+        )
+        sql_licences = select_azure_sql_license_prices(
+            fetch_azure_retail_items(session, sql_filter), sql_edition,
+            {vcpu for vcpu, _ in target_shapes},
+        )
     disk_filter = (
         f"serviceName eq 'Storage' and armRegionName eq '{AZURE_REGION}' "
         "and productName eq 'Standard SSD Managed Disks' and priceType eq 'Consumption'"
     )
-    disk = select_azure_e10_price(fetch_azure_retail_items(session, disk_filter))
+    disk_items = fetch_azure_retail_items(session, disk_filter)
+    disk_prices = {
+        tier: select_azure_disk_price(disk_items, tier)
+        for tier in {"E10", *(azure_disk_tier(size) for _, size in data_disks)}
+    }
+    data_disk_monthly_aud = sum(
+        (disk_prices[azure_disk_tier(size)].value * count for count, size in data_disks),
+        Decimal("0"),
+    )
+    data_disk_description = describe_data_disks(data_disks, "Azure")
+    backup_storage_gib = Decimal("0")
+    backup_monthly_aud = Decimal("0")
+    if backup:
+        backup_filter = (
+            f"serviceName eq 'Backup' and armRegionName eq '{AZURE_REGION}' "
+            "and priceType eq 'Consumption'"
+        )
+        backup_items = fetch_azure_retail_items(session, backup_filter)
+        redundancy = backup.redundancy.upper()
+        storage_price = select_azure_backup_price(
+            backup_items, f"Standard {redundancy} Data Stored", "1 GB/Month"
+        )
+        instance_price = select_azure_backup_price(
+            backup_items, "Azure VM Protected Instance", "1/Month"
+        )
+        volumes = [(1, 128), *data_disks]
+        backup_storage_gib = estimated_backup_storage_gib(
+            volumes, backup.used_pct, backup.daily_change_pct,
+        )
+        used_gib = sum(
+            (count * Decimal(size) * backup.used_pct / 100 for count, size in volumes), Decimal("0")
+        )
+        backup_monthly_aud = (
+            backup_storage_gib * storage_price.value
+            + azure_backup_protected_units(used_gib) * instance_price.value
+        )
     rows: list[ResultRow] = []
     for operating_system in operating_systems:
         base_os = OS_WINDOWS if operating_system == OS_WINDOWS else OS_LINUX
@@ -505,9 +746,22 @@ def collect_azure(
                     compute_price.value + licence.value,
                     max(compute_price.effective_date, licence.effective_date),
                 )
+            sql_price = sql_licences.get(size.vcpu)
             rows.append(build_row(
                 "Azure", AZURE_REGION, size, compute_price.value, "128 GiB Standard SSD LRS (E10)",
-                disk.value, hours, compute_price.effective_date, operating_system=operating_system,
+                disk_prices["E10"].value, hours,
+                max(compute_price.effective_date, sql_price.effective_date) if sql_price else compute_price.effective_date,
+                operating_system=operating_system, data_disks=data_disk_description,
+                data_disks_monthly=data_disk_monthly_aud,
+                sql_edition=sql_edition.title() if sql_edition else "None",
+                sql_hourly=sql_price.value if sql_price else Decimal("0"),
+                backup=(
+                    f"Azure VM Backup, same-region {backup.redundancy.upper()}; "
+                    f"{display_value(backup.used_pct)}% used, "
+                    f"{display_value(backup.daily_change_pct)}% changed/day"
+                ) if backup else "None",
+                backup_storage_gib=backup_storage_gib,
+                backup_monthly=backup_monthly_aud,
             ))
     if not rows:
         raise PricingError("Azure returned no matching VM sizes with the requested PAYG OS rate")
@@ -523,8 +777,15 @@ EXCEL_COLUMNS = [
     ("vCPU", "vcpu"),
     ("RAM (GiB)", "memory_gib"),
     ("Compute / Hour (AUD)", "compute_hourly_aud"),
-    ("Disk", "disk"),
-    ("Disk / Month (AUD)", "disk_monthly_aud"),
+    ("SQL Server Edition", "sql_edition"),
+    ("SQL Licence / Hour (AUD)", "sql_hourly_aud"),
+    ("OS Disk", "disk"),
+    ("OS Disk / Month (AUD)", "disk_monthly_aud"),
+    ("Data Disks", "data_disks"),
+    ("Data Disks / Month (AUD)", "data_disks_monthly_aud"),
+    ("Backup", "backup"),
+    ("Est. Backup Stored (GiB)", "backup_storage_gib"),
+    ("Backup / Month (AUD)", "backup_monthly_aud"),
     ("Total / Hour (AUD)", "total_hourly_aud"),
     ("Total / Month (AUD)", "total_monthly_aud"),
     ("Currency", "currency"),
@@ -562,7 +823,9 @@ def write_excel(rows: Sequence[ResultRow], path: Path) -> None:
     }
     group_border = Border(top=Side(style="medium", color="4472C4"))
     currency_fields = {
-        "compute_hourly_aud", "disk_monthly_aud", "total_hourly_aud", "total_monthly_aud"
+        "compute_hourly_aud", "sql_hourly_aud", "disk_monthly_aud", "data_disks_monthly_aud",
+        "backup_monthly_aud",
+        "total_hourly_aud", "total_monthly_aud"
     }
 
     for provider in ("AWS", "Azure"):
@@ -575,9 +838,21 @@ def write_excel(rows: Sequence[ResultRow], path: Path) -> None:
             else "one 128 GiB Standard SSD LRS managed OS disk (E10)"
         )
         sheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+        data_disk_description = provider_rows[0].data_disks if provider_rows else "None"
+        sql_description = (
+            f"SQL Server {provider_rows[0].sql_edition} PAYG licence; "
+            if provider_rows and provider_rows[0].sql_edition != "None" else ""
+        )
+        backup_description = (
+            f" backups: {provider_rows[0].backup}; 14 daily, 4 weekly, 3 monthly;"
+            if provider_rows and provider_rows[0].backup != "None" else ""
+        )
         note = sheet.cell(
             1, 1,
-            f"Pricing basis: VM compute and OS licensing (where applicable) plus {disk_description}; no extra data disk.",
+            f"Pricing basis: VM compute and OS licensing (where applicable); {sql_description}"
+            f"{disk_description}; "
+            + (f"data disks: {data_disk_description};" if data_disk_description != "None" else "no extra data disk;")
+            + backup_description,
         )
         note.font = Font(bold=True, color="1F1F1F")
         note.fill = PatternFill("solid", fgColor="D9EAD3")
@@ -618,6 +893,9 @@ def write_excel(rows: Sequence[ResultRow], path: Path) -> None:
             elif field == "memory_gib":
                 for row_index in range(4, sheet.max_row + 1):
                     sheet.cell(row_index, column_index).number_format = '0.##'
+            elif field == "backup_storage_gib":
+                for row_index in range(4, sheet.max_row + 1):
+                    sheet.cell(row_index, column_index).number_format = '0.##'
             elif field == "fx_aud_usd":
                 for row_index in range(4, sheet.max_row + 1):
                     sheet.cell(row_index, column_index).number_format = '0.000000'
@@ -633,7 +911,7 @@ def write_excel(rows: Sequence[ResultRow], path: Path) -> None:
 
 
 def print_table(rows: Sequence[ResultRow], target_shapes: frozenset[tuple[int, Decimal]]) -> None:
-    headers = ["Instance", "Compute/hr AUD", "Disk/mo AUD", "Total/mo AUD"]
+    headers = ["Instance", "Compute/hr AUD", "SQL/hr AUD", "OS disk/mo AUD", "Data disks/mo AUD", "Backup/mo AUD", "Total/mo AUD"]
     for provider in ("AWS", "Azure"):
         provider_rows = [row for row in rows if row.provider == provider]
         if not provider_rows:
@@ -644,7 +922,21 @@ def print_table(rows: Sequence[ResultRow], target_shapes: frozenset[tuple[int, D
             if provider == "AWS"
             else "128 GiB Standard SSD LRS managed OS disk (E10)"
         )
-        print(f"  Pricing includes VM compute, OS licensing where applicable, and one {disk_description}; no extra data disk.")
+        data_disk_description = provider_rows[0].data_disks
+        sql_description = (
+            f"SQL Server {provider_rows[0].sql_edition} PAYG licence; "
+            if provider_rows[0].sql_edition != "None" else ""
+        )
+        print(
+            f"  Pricing includes VM compute, OS licensing where applicable; {sql_description}"
+            f"one {disk_description}; "
+            + (f"data disks: {data_disk_description}." if data_disk_description != "None" else "no extra data disk.")
+        )
+        if provider_rows[0].backup != "None":
+            print(
+                f"  Backup: {provider_rows[0].backup}; 14 daily, 4 weekly, 3 monthly; "
+                f"estimated stored data {display_value(provider_rows[0].backup_storage_gib)} GiB."
+            )
         for operating_system in ALL_OPERATING_SYSTEMS:
             for vcpu, memory in sorted(target_shapes):
                 group_rows = [
@@ -657,8 +949,10 @@ def print_table(rows: Sequence[ResultRow], target_shapes: frozenset[tuple[int, D
                     continue
                 print(f"\n  {operating_system} — {vcpu} vCPU / {display_value(memory)} GiB RAM")
                 data = [
-                    [row.instance_type, f"{row.compute_hourly_aud:.4f}",
-                     f"{row.disk_monthly_aud:.2f}", f"{row.total_monthly_aud:.2f}"]
+                    [row.instance_type, f"{row.compute_hourly_aud:.4f}", f"{row.sql_hourly_aud:.4f}",
+                     f"{row.disk_monthly_aud:.2f}", f"{row.data_disks_monthly_aud:.2f}",
+                     f"{row.backup_monthly_aud:.2f}",
+                     f"{row.total_monthly_aud:.2f}"]
                     for row in group_rows
                 ]
                 widths = [
@@ -709,6 +1003,17 @@ def parse_shape(value: str) -> tuple[int, Decimal]:
     return vcpu, memory.normalize()
 
 
+def parse_disk(value: str) -> tuple[int, int]:
+    match = re.fullmatch(r"(?:(\d+)[xX])?(\d+)", value)
+    if not match:
+        raise argparse.ArgumentTypeError("disk must use SIZE_GIB or COUNTxSIZE_GIB, for example 1024 or 2x1024")
+    count = int(match.group(1) or 1)
+    size = int(match.group(2))
+    if count <= 0 or not 1 <= size <= 32767:
+        raise argparse.ArgumentTypeError("disk count must be positive and size must be 1–32767 GiB")
+    return count, size
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--aws-profile", help="AWS shared-config profile (default: normal credential chain)")
@@ -720,6 +1025,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Exact VM build to query; repeat for multiple builds (default: 4:16)",
     )
     parser.add_argument(
+        "--disk", action="append", type=parse_disk, metavar="[COUNTx]SIZE_GIB",
+        help="Additional data disk(s) in GiB; repeat as needed (for example, --disk 1024 --disk 2x512)",
+    )
+    parser.add_argument(
         "--top", type=int, default=5,
         help="Cheapest rows per provider, OS, and VM shape (default: 5)",
     )
@@ -727,12 +1036,35 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--os", choices=("windows", "linux", "rhel", "all"), default="all",
         help="Operating-system pricing to include (default: all three)",
     )
+    parser.add_argument(
+        "--sql", choices=SQL_EDITIONS,
+        help="Add PAYG SQL Server licensing on Windows: web, standard, or enterprise",
+    )
+    parser.add_argument(
+        "--backup", action="store_true",
+        help="Estimate same-region VM backups: 14 daily, 4 weekly, and 3 monthly restore points",
+    )
+    parser.add_argument(
+        "--backup-used-pct", type=Decimal, default=DEFAULT_BACKUP_USED_PCT, metavar="PCT",
+        help="Estimated percent of each disk used (default: 50)",
+    )
+    parser.add_argument(
+        "--backup-daily-change-pct", type=Decimal, default=DEFAULT_BACKUP_DAILY_CHANGE_PCT,
+        metavar="PCT", help="Daily changed data as percent of used data (default: 2)",
+    )
+    parser.add_argument(
+        "--backup-redundancy", choices=("zrs", "lrs"), default="zrs",
+        help="Azure Backup vault storage redundancy in the same region (default: zrs)",
+    )
     parser.add_argument("--allow-partial", action="store_true", help="Write results if one provider fails")
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.sql and args.os != "windows":
+        print("error: --sql requires --os windows", file=sys.stderr)
+        return 2
     if not args.azure_subscription_id:
         print("error: supply --azure-subscription-id or AZURE_SUBSCRIPTION_ID", file=sys.stderr)
         return 2
@@ -742,6 +1074,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.top <= 0:
         print("error: --top must be positive", file=sys.stderr)
         return 2
+    if (
+        not args.backup_used_pct.is_finite() or not 0 < args.backup_used_pct <= 100
+        or not args.backup_daily_change_pct.is_finite()
+        or not 0 <= args.backup_daily_change_pct <= 100
+    ):
+        print("error: backup used percent must be >0–100 and daily change percent must be 0–100", file=sys.stderr)
+        return 2
     if args.output.suffix.lower() != ".xlsx":
         print("error: --output must use the .xlsx extension", file=sys.stderr)
         return 2
@@ -750,14 +1089,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     os_choices = {"windows": OS_WINDOWS, "linux": OS_LINUX, "rhel": OS_RHEL}
     operating_systems = ALL_OPERATING_SYSTEMS if args.os == "all" else (os_choices[args.os],)
     target_shapes = frozenset(args.shape or DEFAULT_TARGET_SHAPES)
+    backup = BackupConfig(
+        args.backup_used_pct, args.backup_daily_change_pct, args.backup_redundancy
+    ) if args.backup else None
     rows: list[ResultRow] = []
     failures: list[str] = []
     collectors = (
         ("AWS", lambda: collect_aws(
-            args.aws_profile, args.hours_per_month, session, operating_systems, target_shapes
+            args.aws_profile, args.hours_per_month, session, operating_systems, target_shapes,
+            args.disk or (), args.sql, backup,
         )),
         ("Azure", lambda: collect_azure(
-            args.azure_subscription_id, args.hours_per_month, session, operating_systems, target_shapes
+            args.azure_subscription_id, args.hours_per_month, session, operating_systems, target_shapes,
+            args.disk or (), args.sql, backup,
         )),
     )
     for provider, collect in collectors:

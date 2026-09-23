@@ -1,24 +1,40 @@
 import unittest
+from contextlib import redirect_stderr
 from decimal import Decimal
+from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from openpyxl import load_workbook
 
 from vm_pricing import (
     AZURE_REGION,
+    BackupConfig,
     OS_LINUX,
     OS_RHEL,
     OS_WINDOWS,
+    Price,
     VmSize,
+    azure_disk_tier,
     build_row,
+    azure_backup_protected_units,
     cheapest_per_provider,
+    collect_aws,
+    collect_azure,
+    estimated_backup_storage_gib,
     fetch_aws_compute_price,
+    fetch_aws_snapshot_price,
+    main,
     parse_args,
+    parse_disk,
     parse_azure_sizes,
     parse_rba_usd_rate,
     parse_shape,
     select_azure_e10_price,
+    select_azure_disk_price,
+    select_azure_sql_license_prices,
+    select_azure_backup_price,
     select_azure_rhel_license_prices,
     select_azure_windows_prices,
     write_excel,
@@ -45,16 +61,19 @@ class PricingTests(unittest.TestCase):
         self.assertEqual(parse_rba_usd_rate(xml), (Decimal("0.66"), "2026-08-31"))
 
     def test_azure_sizes_require_exact_shape_and_availability(self):
-        def sku(name, cpu, ram, architecture="x64", restrictions=None):
+        def sku(name, cpu, ram, architecture="x64", restrictions=None, available_cpu=None):
+            capabilities = [
+                {"name": "vCPUs", "value": str(cpu)},
+                {"name": "MemoryGB", "value": str(ram)},
+                {"name": "CpuArchitectureType", "value": architecture},
+            ]
+            if available_cpu is not None:
+                capabilities.append({"name": "vCPUsAvailable", "value": str(available_cpu)})
             return {
                 "name": name,
                 "resourceType": "virtualMachines",
                 "locations": [AZURE_REGION],
-                "capabilities": [
-                    {"name": "vCPUs", "value": str(cpu)},
-                    {"name": "MemoryGB", "value": str(ram)},
-                    {"name": "CpuArchitectureType", "value": architecture},
-                ],
+                "capabilities": capabilities,
                 "restrictions": restrictions or [],
             }
 
@@ -71,6 +90,19 @@ class PricingTests(unittest.TestCase):
             [item.name for item in parse_azure_sizes(items, custom_shapes)],
             ["Standard_Good2", "Standard_Good4"],
         )
+
+        constrained = sku("Standard_E4-2as_v5", 4, 32, available_cpu=2)
+        unconstrained = sku("Standard_E4as_v5", 4, 32, available_cpu=4)
+        requested = frozenset({(4, Decimal("32"))})
+        self.assertEqual(
+            [item.name for item in parse_azure_sizes([constrained, unconstrained], requested)],
+            ["Standard_E4as_v5"],
+        )
+        self.assertEqual(
+            [item.name for item in parse_azure_sizes([constrained], frozenset({(2, Decimal("32"))}))],
+            ["Standard_E4-2as_v5"],
+        )
+        self.assertEqual(parse_azure_sizes([sku("Standard_E4-2as_v5", 4, 32)], requested), [])
 
     def test_azure_windows_selector_excludes_non_payg_rates(self):
         base = {
@@ -217,6 +249,213 @@ class PricingTests(unittest.TestCase):
         for value in ("8", "x:32", "4:zero", "0:16", "4:-1"):
             with self.subTest(value=value), self.assertRaises(Exception):
                 parse_shape(value)
+
+    def test_disk_cli_accepts_multiple_sizes_and_counts(self):
+        args = parse_args(["--shape", "4:32", "--disk", "1024", "--disk", "2x512"])
+        self.assertEqual(args.disk, [(1, 1024), (2, 512)])
+        self.assertEqual(parse_disk("1x1024"), (1, 1024))
+
+    def test_disk_cli_rejects_invalid_sizes_and_counts(self):
+        for value in ("0", "0x1024", "2x0", "1tb", "2x1.5", "32768", "1x"):
+            with self.subTest(value=value), self.assertRaises(Exception):
+                parse_disk(value)
+
+    def test_azure_disk_tier_rounds_up_and_ignores_operations(self):
+        self.assertEqual(azure_disk_tier(1024), "E30")
+        self.assertEqual(azure_disk_tier(1025), "E40")
+        self.assertEqual(azure_disk_tier(129), "E15")
+        items = [
+            {"meterName": "E30 LRS Disk Operations", "type": "Consumption", "unitOfMeasure": "10K",
+             "retailPrice": 1, "effectiveStartDate": "2026-01-01"},
+            {"meterName": "E30 LRS Disk", "type": "Consumption", "unitOfMeasure": "1/Month",
+             "retailPrice": 50, "effectiveStartDate": "2026-01-01"},
+        ]
+        self.assertEqual(select_azure_disk_price(items, "E30").value, Decimal("50"))
+
+    def test_requested_data_disks_are_added_for_both_providers(self):
+        size = VmSize("test", 4, Decimal("32"))
+        disks = [(2, 1024), (1, 512)]
+        shape = frozenset({(4, Decimal("32"))})
+        with patch("vm_pricing.aws_clients", return_value=(object(), object())), \
+             patch("vm_pricing.discover_aws_sizes", return_value=[size]), \
+             patch("vm_pricing.fetch_rba_usd_rate", return_value=(Decimal("0.5"), "2026-01-01")), \
+             patch("vm_pricing.fetch_aws_gp3_price", return_value=Price(Decimal("0.1"), "2026-01-01")), \
+             patch("vm_pricing.fetch_aws_compute_price", return_value=Price(Decimal("1"), "2026-01-01")):
+            aws = collect_aws(None, Decimal("730"), object(), (OS_WINDOWS,), shape, disks)[0]
+        self.assertEqual(aws.disk_monthly_aud, Decimal("25.6"))
+        self.assertEqual(aws.data_disks_monthly_aud, Decimal("512"))
+        self.assertEqual(aws.total_monthly_aud, Decimal("1997.6"))
+        self.assertIn("2 x 1024 GiB gp3", aws.data_disks)
+
+        items = [
+            {"meterName": tier + " LRS Disk", "type": "Consumption", "unitOfMeasure": "1/Month",
+             "retailPrice": price, "effectiveStartDate": "2026-01-01"}
+            for tier, price in (("E10", 10), ("E20", 30), ("E30", 50))
+        ]
+        with patch("vm_pricing.discover_azure_sizes", return_value=[size]), \
+             patch("vm_pricing.fetch_azure_retail_items", side_effect=[[], items]), \
+             patch("vm_pricing.select_azure_compute_prices", return_value={"test": Price(Decimal("1"), "2026-01-01")}):
+            azure = collect_azure("subscription", Decimal("730"), object(), (OS_WINDOWS,), shape, disks)[0]
+        self.assertEqual(azure.disk_monthly_aud, Decimal("10"))
+        self.assertEqual(azure.data_disks_monthly_aud, Decimal("130"))
+        self.assertEqual(azure.total_monthly_aud, Decimal("870"))
+        self.assertIn("(E30)", azure.data_disks)
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "prices.xlsx"
+            write_excel([aws, azure], path)
+            workbook = load_workbook(path)
+            self.assertIn("2 x 1024 GiB", workbook["AWS"]["A1"].value)
+            self.assertEqual(workbook["AWS"]["N4"].value, 512)
+            self.assertEqual(workbook["Azure"]["S4"].value, 870)
+
+    def test_backup_estimate_uses_retained_changes_and_provider_charges(self):
+        backup = BackupConfig(Decimal("50"), Decimal("2"))
+        disks = [(1, 1024)]
+        self.assertEqual(
+            estimated_backup_storage_gib([(1, 128), *disks], backup.used_pct, backup.daily_change_pct),
+            Decimal("1612.8"),
+        )
+        size = VmSize("test", 4, Decimal("32"))
+        shape = frozenset({(4, Decimal("32"))})
+        with patch("vm_pricing.aws_clients", return_value=(object(), object())), \
+             patch("vm_pricing.discover_aws_sizes", return_value=[size]), \
+             patch("vm_pricing.fetch_rba_usd_rate", return_value=(Decimal("0.5"), "2026-01-01")), \
+             patch("vm_pricing.fetch_aws_gp3_price", return_value=Price(Decimal("0.1"), "2026-01-01")), \
+             patch("vm_pricing.fetch_aws_snapshot_price", return_value=Price(Decimal("0.05"), "2026-01-01")), \
+             patch("vm_pricing.fetch_aws_compute_price", return_value=Price(Decimal("1"), "2026-01-01")):
+            aws = collect_aws(None, Decimal("730"), object(), (OS_WINDOWS,), shape, disks, None, backup)[0]
+        self.assertEqual(aws.backup_monthly_aud, Decimal("161.28"))
+        self.assertEqual(aws.total_monthly_aud, Decimal("1851.68"))
+
+        backup_items = [
+            {"productName": "Backup", "meterName": meter, "unitOfMeasure": unit,
+             "retailPrice": price, "type": "Consumption", "armRegionName": AZURE_REGION,
+             "effectiveStartDate": "2026-01-01"}
+            for meter, unit, price in (
+                ("Standard ZRS Data Stored", "1 GB/Month", "0.04"),
+                ("Azure VM Protected Instance", "1/Month", "13.9"),
+            )
+        ]
+        self.assertEqual(
+            select_azure_backup_price(backup_items, "Standard ZRS Data Stored", "1 GB/Month").value,
+            Decimal("0.04"),
+        )
+        disk_items = [
+            {"meterName": tier + " LRS Disk", "type": "Consumption", "unitOfMeasure": "1/Month",
+             "retailPrice": price, "effectiveStartDate": "2026-01-01"}
+            for tier, price in (("E10", 10), ("E30", 50))
+        ]
+        with patch("vm_pricing.discover_azure_sizes", return_value=[size]), \
+             patch("vm_pricing.fetch_azure_retail_items", side_effect=[[], disk_items, backup_items]), \
+             patch("vm_pricing.select_azure_compute_prices", return_value={"test": Price(Decimal("1"), "2026-01-01")}):
+            azure = collect_azure("subscription", Decimal("730"), object(), (OS_WINDOWS,), shape, disks, None, backup)[0]
+        self.assertEqual(azure.backup_monthly_aud, Decimal("92.312"))
+        self.assertEqual(azure.total_monthly_aud, Decimal("882.312"))
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "backup.xlsx"
+            write_excel([aws, azure], path)
+            workbook = load_workbook(path)
+            self.assertEqual(workbook["AWS"]["P4"].value, 1612.8)
+            self.assertEqual(workbook["Azure"]["Q4"].value, 92.312)
+
+    def test_backup_price_selectors_and_protected_instance_tiers(self):
+        self.assertEqual(azure_backup_protected_units(Decimal("50")), Decimal("0.5"))
+        self.assertEqual(azure_backup_protected_units(Decimal("500")), Decimal("1"))
+        self.assertEqual(azure_backup_protected_units(Decimal("501")), Decimal("2"))
+        filters_seen = []
+
+        def products(pricing, filters):
+            filters_seen.extend(filters)
+            return iter([{
+                "product": {"attributes": {"usagetype": "APS2-EBS:SnapshotUsage"}},
+                "terms": {"OnDemand": {"term": {
+                    "effectiveDate": "2026-01-01",
+                    "priceDimensions": {"dimension": {
+                        "unit": "GB-Mo", "beginRange": "0", "pricePerUnit": {"USD": "0.06"},
+                    }},
+                }}},
+            }])
+
+        with patch("vm_pricing.aws_products", side_effect=products):
+            price = fetch_aws_snapshot_price(object())
+        self.assertEqual(price.value, Decimal("0.06"))
+        self.assertIn(
+            {"Type": "TERM_MATCH", "Field": "usagetype", "Value": "APS2-EBS:SnapshotUsage"},
+            filters_seen,
+        )
+
+    def test_sql_requires_windows_and_accepts_paid_editions(self):
+        for edition in ("web", "standard", "enterprise"):
+            self.assertEqual(parse_args(["--os", "windows", "--sql", edition]).sql, edition)
+        errors = StringIO()
+        with redirect_stderr(errors):
+            self.assertEqual(main(["--os", "linux", "--sql", "standard"]), 2)
+            self.assertEqual(main(["--sql", "standard"]), 2)
+        self.assertEqual(errors.getvalue().count("--sql requires --os windows"), 2)
+
+    def test_aws_sql_uses_windows_licence_included_product(self):
+        filters_seen = []
+
+        def products(pricing, filters):
+            filters_seen.extend(filters)
+            return iter([{"terms": {"OnDemand": {"term": {
+                "effectiveDate": "2026-01-01",
+                "priceDimensions": {"dimension": {
+                    "unit": "Hrs", "beginRange": "0", "pricePerUnit": {"USD": "1.5"},
+                }},
+            }}}}])
+
+        with patch("vm_pricing.aws_products", side_effect=products):
+            price = fetch_aws_compute_price(object(), "m.test", OS_WINDOWS, "standard")
+        self.assertEqual(price.value, Decimal("1.5"))
+        self.assertIn({"Type": "TERM_MATCH", "Field": "preInstalledSw", "Value": "SQL Std"}, filters_seen)
+        self.assertIn({"Type": "TERM_MATCH", "Field": "operation", "Value": "RunInstances:0006"}, filters_seen)
+
+    def test_sql_licence_is_added_without_double_counting_windows(self):
+        size = VmSize("test", 4, Decimal("32"))
+        shape = frozenset({(4, Decimal("32"))})
+
+        def aws_price(pricing, instance_type, operating_system=OS_WINDOWS, sql_edition=None):
+            return Price(Decimal("1.5" if sql_edition else "1"), "2026-01-01")
+
+        with patch("vm_pricing.aws_clients", return_value=(object(), object())), \
+             patch("vm_pricing.discover_aws_sizes", return_value=[size]), \
+             patch("vm_pricing.fetch_rba_usd_rate", return_value=(Decimal("0.5"), "2026-01-01")), \
+             patch("vm_pricing.fetch_aws_gp3_price", return_value=Price(Decimal("0.1"), "2026-01-01")), \
+             patch("vm_pricing.fetch_aws_compute_price", side_effect=aws_price):
+            aws = collect_aws(None, Decimal("730"), object(), (OS_WINDOWS,), shape, (), "standard")[0]
+        self.assertEqual(aws.compute_hourly_aud, Decimal("2"))
+        self.assertEqual(aws.sql_hourly_aud, Decimal("1"))
+        self.assertEqual(aws.total_monthly_aud, Decimal("2215.6"))
+
+        sql_items = [{
+            "serviceName": "Virtual Machines Licenses", "productName": "SQL Server Standard",
+            "meterName": "1-4 vCPU VM License", "type": "Consumption", "unitOfMeasure": "1 Hour",
+            "retailPrice": "0.6", "effectiveStartDate": "2026-01-01",
+        }]
+        self.assertEqual(
+            select_azure_sql_license_prices(sql_items, "standard", (4,))[4].value,
+            Decimal("0.6"),
+        )
+        disk_items = [{
+            "meterName": "E10 LRS Disk", "type": "Consumption", "unitOfMeasure": "1/Month",
+            "retailPrice": 10, "effectiveStartDate": "2026-01-01",
+        }]
+        with patch("vm_pricing.discover_azure_sizes", return_value=[size]), \
+             patch("vm_pricing.fetch_azure_retail_items", side_effect=[[], sql_items, disk_items]), \
+             patch("vm_pricing.select_azure_compute_prices", return_value={"test": Price(Decimal("1"), "2026-01-01")}):
+            azure = collect_azure("subscription", Decimal("730"), object(), (OS_WINDOWS,), shape, (), "standard")[0]
+        self.assertEqual(azure.compute_hourly_aud, Decimal("1"))
+        self.assertEqual(azure.sql_hourly_aud, Decimal("0.6"))
+        self.assertEqual(azure.total_monthly_aud, Decimal("1178.0"))
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "sql.xlsx"
+            write_excel([aws, azure], path)
+            workbook = load_workbook(path)
+            self.assertEqual(workbook["AWS"]["I4"].value, "Standard")
+            self.assertEqual(workbook["AWS"]["J4"].value, 1)
+            self.assertEqual(workbook["Azure"]["J4"].value, 0.6)
 
 
 if __name__ == "__main__":
